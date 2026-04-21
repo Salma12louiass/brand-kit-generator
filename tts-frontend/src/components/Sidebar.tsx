@@ -2,7 +2,7 @@ import React from 'react';
 
 interface SidebarProps {
   activeMenu: string;
-  setActiveMenu: (menu: 'text-to-text' | 'text-to-speech' | 'speech-to-text') => void;
+  setActiveMenu: (menu: 'text-to-text' | 'text-to-speech' | 'speech-to-text' | 'speech-to-speech') => void;
 }
 
 const Sidebar: React.FC<SidebarProps> = ({ activeMenu, setActiveMenu }) => {
@@ -25,6 +25,12 @@ const Sidebar: React.FC<SidebarProps> = ({ activeMenu, setActiveMenu }) => {
       label: 'Speech to Text',
       subtitle: 'Transcribe audio',
     },
+    {
+    id: 'speech-to-speech' as const,
+    icon: '🎧',
+    label: 'Speech to Speech',
+    subtitle: 'Clean & Enhance audio',
+  },
   ];
 
   return (

@@ -1,3 +1,5 @@
+//ttsfrontend/srs/components/TextToSpeech.tsx
+
 import React, { useState, useRef, useEffect } from 'react';
 import axios from 'axios';
 
@@ -150,9 +152,15 @@ const TextToSpeech: React.FC = () => {
 
     try {
       const payload: any = {
-        text: text,
-        voice_type: voiceType,
-      };
+  text: text,
+  voice_type: voiceType,
+};
+
+if (voiceType === 'default') {
+  payload.voice = selectedVoice;
+} else {
+  payload.custom_voice_id = customVoiceId;
+}
 
       if (voiceType === 'default') {
         payload.voice = selectedVoice;
@@ -185,7 +193,7 @@ const TextToSpeech: React.FC = () => {
     if (audioUrl) {
       const link = document.createElement('a');
       link.href = audioUrl;
-      link.download = `speech_${Date.now()}.mp3`;
+      link.download =  `speech_${Date.now()}.${voiceType === 'custom' ? 'wav' : 'mp3'}`;
       link.click();
     }
   };

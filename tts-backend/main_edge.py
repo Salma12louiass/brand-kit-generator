@@ -1,4 +1,4 @@
-# main_edge.py - Version LÉGÈRE avec clonage vocal
+# /tts-backend/main_edge.py
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,9 +8,26 @@ import whisper
 import uuid
 import os
 import logging
-import requests
-import base64
-import asyncio
+import subprocess
+import shutil
+
+import noisereduce as nr
+import numpy as np
+from df.enhance import enhance, init_df
+from df.io import load_audio, save_audio
+from pydub import AudioSegment
+import soundfile as sf
+
+from fastapi import UploadFile, File
+from fastapi.responses import FileResponse, JSONResponse
+import os, uuid
+
+from df.enhance import enhance, init_df
+from df.io import load_audio, save_audio
+from pydub import AudioSegment
+import ollama
+from TTS.api import TTS
+import torch
 
 # ============ CONFIGURATION ============
 logging.basicConfig(level=logging.INFO)
@@ -18,7 +35,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Configuration CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://localhost:3000", "http://localhost:5174"],
@@ -35,20 +51,29 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(VOICE_CLONES_DIR, exist_ok=True)
 
-# ============ TA CLÉ API HUGGING FACE ============
-import os
+# ============ WHISPER ============
+print("🔄 Chargement de Whisper...")
+whisper_model = whisper.load_model("tiny")
+print("✅ Whisper chargé!")
 
-HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
-# ============ CHARGEMENT WHISPER (pour STT) ============
-print("🔄 Chargement du modèle Whisper...")
+# ============ XTTS-v2 (CLONAGE VOCAL) ============
+print("🔄 Chargement de XTTS-v2 (clonage vocal)...")
 try:
-    whisper_model = whisper.load_model("tiny")  # Modèle tiny = plus léger
-    print("✅ Whisper chargé avec succès!")
+    xtts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
+    print("✅ XTTS-v2 chargé!")
 except Exception as e:
-    print(f"❌ Erreur chargement Whisper: {e}")
-    whisper_model = None
+    print(f"⚠️ XTTS-v2 non disponible: {e}")
+    xtts_model = None
 
-# ============ VOIX PRÉDÉFINIES ============
+# ============ OLLAMA ============
+print("🔄 Vérification d'Ollama...")
+try:
+    ollama.list()
+    print("✅ Ollama est prêt!")
+except:
+    print("⚠️ Ollama non trouvé")
+
+# ============ VOIX ============
 class TTSRequest(BaseModel):
     text: str
     voice: str = "fr-FR-DeniseNeural"
@@ -59,58 +84,28 @@ VOICES = {
     "Français": [
         {"id": "fr-FR-DeniseNeural", "name": "Denise", "gender": "female"},
         {"id": "fr-FR-HenriNeural", "name": "Henri", "gender": "male"},
-        {"id": "fr-FR-EloiseNeural", "name": "Eloise", "gender": "female"},
     ],
     "English": [
         {"id": "en-US-JennyNeural", "name": "Jenny", "gender": "female"},
         {"id": "en-US-GuyNeural", "name": "Guy", "gender": "male"},
-        {"id": "en-US-AriaNeural", "name": "Aria", "gender": "female"},
     ],
     "Arabic": [
         {"id": "ar-EG-SalmaNeural", "name": "Salma", "gender": "female"},
         {"id": "ar-EG-ShakirNeural", "name": "Shakir", "gender": "male"},
-        {"id": "ar-SA-ZariyahNeural", "name": "Zariyah", "gender": "female"},
     ],
 }
 
+class ChatRequest(BaseModel):
+    message: str
+    history: list = []
+
+# ============ ROUTES ============
 @app.get("/api/voices")
 def get_voices():
     return VOICES
 
-# ============ UPLOAD VOIX POUR CLONAGE ============
-@app.post("/api/upload-voice")
-async def upload_voice(file: UploadFile = File(...)):
-    """Uploader un fichier audio pour cloner une voix"""
-    try:
-        voice_id = str(uuid.uuid4())
-        file_extension = os.path.splitext(file.filename)[1].lower()
-        
-        if file_extension not in ['.wav', '.mp3', '.m4a', '.ogg']:
-            raise HTTPException(status_code=400, detail="Format non supporté. Utilisez WAV, MP3, M4A ou OGG")
-        
-        voice_filename = f"{voice_id}{file_extension}"
-        voice_path = os.path.join(VOICE_CLONES_DIR, voice_filename)
-        
-        content = await file.read()
-        with open(voice_path, "wb") as f:
-            f.write(content)
-        
-        logger.info(f"✅ Voix uploadée: {voice_filename}")
-        
-        return JSONResponse({
-            "success": True,
-            "voice_id": voice_id,
-            "filename": voice_filename,
-            "message": "Voix uploadée avec succès!"
-        })
-        
-    except Exception as e:
-        logger.error(f"Erreur upload: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/api/custom-voices")
 def get_custom_voices():
-    """Récupérer la liste des voix personnalisées"""
     custom_voices = []
     for filename in os.listdir(VOICE_CLONES_DIR):
         if filename.endswith(('.wav', '.mp3', '.m4a', '.ogg')):
@@ -123,51 +118,24 @@ def get_custom_voices():
             })
     return custom_voices
 
-# ============ CLONAGE VOCAL AVEC HUGGING FACE ============
-def clone_voice_with_huggingface(text: str, reference_audio_path: str) -> bytes:
-    """Utilise l'API Hugging Face pour le clonage vocal"""
-    
-    # Modèle XTTS-v2 (spécialisé dans le clonage vocal)
-    API_URL = "https://api-inference.huggingface.co/models/coqui/XTTS-v2"
-    
-    headers = {
-        "Authorization": f"Bearer {HUGGINGFACE_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    
-    # Lire le fichier audio de référence
-    with open(reference_audio_path, "rb") as f:
-        audio_bytes = f.read()
-    
-    # Encoder l'audio en base64
-    audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
-    
-    payload = {
-        "inputs": text,
-        "parameters": {
-            "speaker_audio": audio_base64,
-            "language": "fr"  # ou "en", "ar"
-        }
-    }
-    
-    logger.info(f"🔄 Appel API Hugging Face pour clonage vocal...")
-    response = requests.post(API_URL, headers=headers, json=payload, timeout=60)
-    
-    if response.status_code == 200:
-        logger.info(f"✅ Clonage vocal réussi! Taille: {len(response.content)} bytes")
-        return response.content
-    else:
-        logger.error(f"❌ API Error: {response.status_code} - {response.text}")
-        raise Exception(f"Erreur API: {response.status_code}")
+@app.post("/api/upload-voice")
+async def upload_voice(file: UploadFile = File(...)):
+    try:
+        voice_id = str(uuid.uuid4())
+        ext = os.path.splitext(file.filename)[1].lower()
+        voice_path = os.path.join(VOICE_CLONES_DIR, f"{voice_id}{ext}")
+        content = await file.read()
+        with open(voice_path, "wb") as f:
+            f.write(content)
+        return {"success": True, "voice_id": voice_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ============ TTS PRINCIPAL ============
+# ============ TEXT TO SPEECH AVEC CLONAGE ============
 @app.post("/api/tts")
 async def generate_speech(request: TTSRequest):
     try:
-        filename = f"{uuid.uuid4()}.mp3"
-        filepath = os.path.join(OUTPUT_DIR, filename)
-        
-        if request.voice_type == "custom" and request.custom_voice_id:
+        if request.voice_type == "custom" and request.custom_voice_id and xtts_model:
             # ===== CLONAGE VOCAL =====
             voice_file = None
             for f in os.listdir(VOICE_CLONES_DIR):
@@ -176,128 +144,228 @@ async def generate_speech(request: TTSRequest):
                     break
             
             if not voice_file:
-                raise HTTPException(status_code=404, detail="Voix personnalisée non trouvée")
+                raise HTTPException(status_code=404, detail="Voix non trouvée")
             
-            logger.info(f"🎤 Clonage vocal avec: {voice_file}")
-            logger.info(f"📝 Texte à générer: {request.text[:100]}...")
+            filename = f"{uuid.uuid4()}.wav"
+            filepath = os.path.join(OUTPUT_DIR, filename)
             
-            try:
-                # Tenter le clonage avec Hugging Face
-                audio_content = clone_voice_with_huggingface(request.text, voice_file)
-                with open(filepath, "wb") as f:
-                    f.write(audio_content)
-                logger.info("✅ Clonage vocal réussi!")
-                
-            except Exception as e:
-                logger.error(f"❌ Erreur clonage: {e}")
-                # Fallback: utiliser Edge-TTS avec voix par défaut
-                logger.info("⚠️ Fallback vers voix par défaut")
-                communicate = edge_tts.Communicate(request.text, "fr-FR-DeniseNeural")
-                await communicate.save(filepath)
+            logger.info(f"🎤 Clonage vocal avec XTTS-v2")
+            
+            # Détection langue
+            lang = "fr"  # par défaut
+            for lang_name, voices in VOICES.items():
+                for v in voices:
+                    if v["id"] == request.voice:
+                        if lang_name == "English":
+                            lang = "en"
+                        elif lang_name == "Arabic":
+                            lang = "ar"
+                        break
+            
+            xtts_model.tts_to_file(
+                text=request.text,
+                speaker_wav=voice_file,
+                language=lang,
+                file_path=filepath
+            )
+            
+            return FileResponse(filepath, media_type="audio/wav", filename=filename)
             
         else:
-            # ===== VOIX PAR DÉFAUT (Edge-TTS) =====
-            logger.info(f"🎤 Génération voix par défaut: {request.voice}")
+            # ===== VOIX PAR DÉFAUT =====
+            filename = f"{uuid.uuid4()}.mp3"
+            filepath = os.path.join(OUTPUT_DIR, filename)
             communicate = edge_tts.Communicate(request.text, request.voice)
             await communicate.save(filepath)
-        
-        return FileResponse(
-            filepath, 
-            media_type="audio/mpeg",
-            filename=filename
-        )
-        
+            return FileResponse(filepath, media_type="audio/mpeg", filename=filename)
+            
     except Exception as e:
-        logger.error(f"❌ Erreur TTS: {e}")
+        logger.error(f"Erreur TTS: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============ SPEECH TO TEXT ============
 @app.post("/api/stt/upload")
 async def transcribe_uploaded_file(file: UploadFile = File(...)):
-    if whisper_model is None:
-        raise HTTPException(status_code=500, detail="Modèle Whisper non chargé")
-    
-    temp_filepath = None
-    
+    temp_path = None
     try:
-        file_extension = os.path.splitext(file.filename)[1].lower()
-        temp_filename = f"{uuid.uuid4()}{file_extension}"
-        temp_filepath = os.path.join(UPLOAD_DIR, temp_filename)
-        
+        ext = os.path.splitext(file.filename)[1].lower()
+        temp_path = os.path.join(UPLOAD_DIR, f"temp_{uuid.uuid4()}{ext}")
         content = await file.read()
-        with open(temp_filepath, "wb") as f:
+        with open(temp_path, "wb") as f:
             f.write(content)
-        
-        result = whisper_model.transcribe(temp_filepath, fp16=False)
-        
-        if temp_filepath and os.path.exists(temp_filepath):
-            os.remove(temp_filepath)
-        
-        return JSONResponse({
-            "success": True,
-            "transcript": result["text"],
-            "language": result.get("language", "unknown")
-        })
-        
-    except Exception as e:
-        logger.error(f"Erreur STT: {e}")
-        if temp_filepath and os.path.exists(temp_filepath):
-            os.remove(temp_filepath)
-        raise HTTPException(status_code=500, detail=str(e))
+        result = whisper_model.transcribe(temp_path, fp16=False)
+        return {"success": True, "transcript": result["text"]}
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
 
 @app.post("/api/stt/record")
 async def transcribe_recording(file: UploadFile = File(...)):
-    if whisper_model is None:
-        raise HTTPException(status_code=500, detail="Modèle Whisper non chargé")
-    
     filepath = None
-    
     try:
-        filename = f"{uuid.uuid4()}.webm"
-        filepath = os.path.join(UPLOAD_DIR, filename)
-        
+        filepath = os.path.join(UPLOAD_DIR, f"recording_{uuid.uuid4()}.webm")
         content = await file.read()
         with open(filepath, "wb") as f:
             f.write(content)
-        
         result = whisper_model.transcribe(filepath, fp16=False)
-        
+        return {"success": True, "transcript": result["text"]}
+    finally:
         if filepath and os.path.exists(filepath):
             os.remove(filepath)
+
+# ============ SPEECH TO SPEECH (Nettoyage audio) ============
+
+# Charger DeepFilterNet une seule fois
+print("🔄 Chargement de DeepFilterNet...")
+try:
+    model, df_state, _ = init_df(model_base_dir="models/DeepFilterNet3")
+    print("✅ DeepFilterNet chargé!")
+    DF_AVAILABLE = True
+except Exception as e:
+    print(f"⚠️ DeepFilterNet non disponible: {e}")
+    DF_AVAILABLE = False
+
+def convert_to_wav(input_bytes: bytes) -> str:
+    """Convertit n'importe quel fichier audio en WAV 16kHz mono"""
+    temp_input = os.path.join(UPLOAD_DIR, f"temp_{uuid.uuid4()}.webm")
+    with open(temp_input, "wb") as f:
+        f.write(input_bytes)
+    
+    wav_path = temp_input.replace('.webm', '.wav')
+    try:
+        audio = AudioSegment.from_file(temp_input)
+        audio = audio.set_channels(1).set_frame_rate(16000)
+        audio.export(wav_path, format="wav")
+    except:
+        shutil.copy(temp_input, wav_path)
+    
+    os.remove(temp_input)
+    return wav_path
+
+def enhance_audio_studio(input_path: str) -> str:
+    """Pipeline complet pour audio qualité studio"""
+    
+    output_path = os.path.join(OUTPUT_DIR, f"studio_{uuid.uuid4()}.wav")
+    
+    # Étape 1: DeepFilterNet (suppression bruit IA)
+    if DF_AVAILABLE:
+        try:
+            audio, sr = load_audio(input_path, sr=df_state.sr())
+            enhanced = enhance(model, df_state, audio)
+            temp_path = output_path.replace('.wav', '_temp.wav')
+            save_audio(temp_path, enhanced, df_state.sr())
+        except Exception as e:
+            logger.warning(f"DeepFilterNet échoué: {e}")
+            temp_path = input_path
+    else:
+        temp_path = input_path
+    
+    # Étape 2: noisereduce (réduction supplémentaire)
+    try:
+        sr, data = sf.read(temp_path)
         
-        return JSONResponse({
-            "success": True,
-            "transcript": result["text"],
-            "language": result.get("language", "unknown")
-        })
+        # Convertir en float
+        if data.dtype != np.float32:
+            data = data.astype(np.float32)
+        
+        # Extraire échantillon de bruit (début du fichier)
+        noise_sample = data[:int(sr * 0.3)]
+        
+        # Réduction de bruit
+        reduced = nr.reduce_noise(
+            y=data,
+            sr=sr,
+            y_noise=noise_sample,
+            prop_decrease=0.85,
+            stationary=False
+        )
+        
+        # Étape 3: Normalisation et amplification
+        # Augmenter le volume
+        max_val = np.max(np.abs(reduced))
+        if max_val > 0:
+            reduced = reduced / max_val * 0.95
+        
+        # Appliquer un EQ simple (boost voix)
+        from scipy import signal
+        b, a = signal.butter(4, [300, 3400], 'bandpass', fs=sr)
+        reduced = signal.filtfilt(b, a, reduced)
+        
+        # Sauvegarder
+        sf.write(output_path, reduced, sr)
         
     except Exception as e:
-        logger.error(f"Erreur STT: {e}")
-        if filepath and os.path.exists(filepath):
-            os.remove(filepath)
+        logger.warning(f"noisereduce échoué: {e}")
+        shutil.copy(temp_path, output_path)
+    
+    # Nettoyer fichiers temporaires
+    if temp_path != input_path and os.path.exists(temp_path):
+        os.remove(temp_path)
+    
+    return output_path
+
+@app.post("/api/speech-to-speech/clean")
+async def clean_audio(file: UploadFile = File(...)):
+    """Nettoie un fichier audio - Qualité Studio"""
+    try:
+        file_extension = os.path.splitext(file.filename)[1].lower()
+        if file_extension not in ['.wav', '.mp3', '.m4a', '.ogg', '.webm']:
+            raise HTTPException(status_code=400, detail="Format non supporté")
+        
+        content = await file.read()
+        input_path = convert_to_wav(content)
+        
+        # Pipeline complet
+        output_path = enhance_audio_studio(input_path)
+        
+        # Nettoyer
+        os.remove(input_path)
+        
+        return FileResponse(
+            output_path,
+            media_type="audio/wav",
+            filename="studio_quality_audio.wav"
+        )
+        
+    except Exception as e:
+        logger.error(f"Erreur nettoyage: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ============ CHATBOT ============
+@app.post("/api/chat")
+async def chat_marketing(request: ChatRequest):
+    try:
+        system_prompt = """Tu es un expert en marketing digital.
+Tu réponds en français, de manière courte et pratique.
+Tu donnes des conseils actionnables (max 150 mots)."""
+
+        response = ollama.chat(
+            model="phi3:mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": request.message}
+            ],
+            options={"temperature": 0.7, "num_predict": 250}
+        )
+        return {"response": response["message"]["content"]}
+    except Exception as e:
+        return {"response": f"❌ Erreur: {e}"}
+
+# ============ HEALTH ============
 @app.get("/api/health")
-def health_check():
-    custom_count = len(os.listdir(VOICE_CLONES_DIR)) if os.path.exists(VOICE_CLONES_DIR) else 0
-    return {
-        "status": "ok",
-        "whisper_loaded": whisper_model is not None,
-        "custom_voices_count": custom_count,
-        "huggingface_token_configured": HUGGINGFACE_TOKEN != "hf_XXXXXXXXXXXXX"
-    }
+def health():
+    return {"status": "ok", "whisper": whisper_model is not None, "xtts": xtts_model is not None}
 
 if __name__ == "__main__":
     import uvicorn
-    print("=" * 50)
-    print("🚀 AdGenerate.ai - Version avec clonage vocal")
-    print("=" * 50)
-    print(f"🎤 Whisper: {'✅ chargé' if whisper_model else '❌ non chargé'}")
-    print(f"🔑 Hugging Face: {'✅ configurée' if HUGGINGFACE_TOKEN != 'hf_XXXXXXXXXXXXX' else '❌'}")
-    print(f"📁 Voix personnalisées: {len(os.listdir(VOICE_CLONES_DIR)) if os.path.exists(VOICE_CLONES_DIR) else 0}")
-    print("=" * 50)
+    print("=" * 60)
+    print("🚀 AdGenerate.ai - Version avec clonage vocal XTTS-v2")
+    print("=" * 60)
+    print("✅ Text to Speech (Edge-TTS + XTTS clonage)")
+    print("✅ Speech to Text (Whisper)")
+    print("✅ Speech to Speech (Nettoyage audio)")
+    print("✅ Chatbot (Ollama)")
+    print("=" * 60)
     print("🌐 Serveur: http://localhost:8000")
-    print("📚 Documentation: http://localhost:8000/docs")
-    print("=" * 50)
-    
+    print("=" * 60)
     uvicorn.run(app, host="0.0.0.0", port=8000)
